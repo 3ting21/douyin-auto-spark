@@ -28,6 +28,9 @@ const SEARCH_RESULT_TIMEOUT = 5000
 const SEARCH_RETRY_LIMIT = 3
 const SEARCH_RETRY_INTERVAL = 2000
 const SEARCH_INPUT_RESET_DELAY = 500
+const MESSAGE_EDITOR_TIMEOUT = 15000
+const MESSAGE_SEND_TIMEOUT = 15000
+const MESSAGE_POLL_INTERVAL = 250
 
 const MESSAGE_TEMPLATE_PLACEHOLDER_PATTERN = /\{\{\s*([a-zA-Z]+)\s*\}\}/g
 const MESSAGE_TEMPLATE_PLACEHOLDERS = [
@@ -157,16 +160,10 @@ async function runDouyinAccount(
         continue
       }
 
-      await searchResult.getByText(/^(发消息|发私信)$/).click({ timeout: 5000 })
+      await openConversation(page, searchResult, targetName)
       console.log(`[${account.name}] 已打开私信：${targetName}`)
 
-      const editorInput = page
-        .locator(
-          '.messageEditorimChatEditorContainer [data-slate-editor="true"][contenteditable="true"]',
-        )
-        .first()
-      await editorInput.waitFor({ state: 'visible', timeout: 10000 })
-      await editorInput.click()
+      const editorInput = await findMessageEditor(page)
 
       let message: string
 
@@ -182,10 +179,10 @@ async function runDouyinAccount(
         message = includeYiyanSource ? `${yiyan.hitokoto}\n——「${yiyan.from}」` : yiyan.hitokoto
       }
 
-      await page.keyboard.insertText(message)
-      await page.keyboard.press('Enter')
-      console.log(`[${account.name}] 已发送消息：${targetName}`)
-      await page.waitForTimeout(1000)
+      const messageCountBeforeSend = await countVisibleMessageText(page, message)
+      await fillMessageEditor(editorInput, message)
+      await sendMessageAndConfirm(page, editorInput, message, messageCountBeforeSend, targetName)
+      console.log(`[${account.name}] 已确认发送消息：${targetName}`)
     }
 
     await page.waitForTimeout(5000)
@@ -207,6 +204,199 @@ async function runDouyinAccount(
       await context.close()
     }
   }
+}
+
+/**
+ * 打开搜索结果中的私信会话。
+ * 抖音不同版本会把入口渲染成 button、div 或带 role 的元素，因此不依赖单一标签。
+ */
+async function openConversation(
+  page: Page,
+  searchResult: Locator,
+  targetName: string,
+): Promise<void> {
+  const candidates = [
+    searchResult.getByText(/^(发消息|发私信)$/).first(),
+    searchResult.getByRole('button', { name: /发消息|发私信/ }).first(),
+    searchResult
+      .locator('[role="button"]')
+      .filter({ hasText: /发消息|发私信/ })
+      .first(),
+  ]
+
+  for (const candidate of candidates) {
+    if (await candidate.isVisible().catch(() => false)) {
+      await candidate.click({ timeout: 5000 })
+      return
+    }
+  }
+
+  throw new Error(`找到会话「${targetName}」，但未找到“发消息/发私信”入口`)
+}
+
+/**
+ * 找到当前聊天窗口的消息编辑器。页面类名经常变化，优先使用语义属性，旧类名仅作兜底。
+ */
+async function findMessageEditor(page: Page): Promise<Locator> {
+  const candidates = [
+    page.locator(
+      '.messageEditorimChatEditorContainer [data-slate-editor="true"][contenteditable="true"]',
+    ),
+    page.locator('[data-slate-editor="true"][contenteditable="true"]'),
+    page.locator('[contenteditable="true"][role="textbox"]'),
+    page.locator('textarea[placeholder*="消息"], textarea[placeholder*="输入"]'),
+    page.locator('[contenteditable="true"]'),
+  ]
+  const deadline = Date.now() + MESSAGE_EDITOR_TIMEOUT
+
+  while (Date.now() < deadline) {
+    for (const candidate of candidates) {
+      const first = candidate.first()
+      if (await first.isVisible().catch(() => false)) {
+        return first
+      }
+    }
+    await page.waitForTimeout(MESSAGE_POLL_INTERVAL)
+  }
+
+  throw new Error('私信编辑框未出现，可能未成功打开聊天窗口')
+}
+
+/**
+ * 写入消息并确认编辑器确实收到了输入事件。
+ * 仅调用 keyboard.insertText 不一定会触发抖音编辑器的状态更新，导致发送按钮仍不可用。
+ */
+async function fillMessageEditor(editor: Locator, message: string): Promise<void> {
+  await editor.click()
+
+  try {
+    await editor.fill(message)
+  } catch {
+    // 某些旧版 Slate 编辑器不支持 fill，退回到真实键盘输入。
+    await editor.press('ControlOrMeta+A')
+    await editor.press('Backspace')
+    await editor.page().keyboard.insertText(message)
+  }
+
+  const deadline = Date.now() + 3000
+  while (Date.now() < deadline) {
+    const currentText = await readEditorText(editor)
+    if (messageTextMatches(currentText, message)) {
+      return
+    }
+    await editor.page().waitForTimeout(MESSAGE_POLL_INTERVAL)
+  }
+
+  throw new Error('消息已尝试写入，但编辑框内容未更新；请检查抖音页面是否仍为聊天窗口')
+}
+
+/**
+ * 点击发送按钮（若当前版本没有按钮则使用 Enter），并等待聊天记录中出现本次消息。
+ * 未确认到消息时抛错，避免日志把“只输入到编辑框”误报成发送成功。
+ */
+async function sendMessageAndConfirm(
+  page: Page,
+  editor: Locator,
+  message: string,
+  messageCountBeforeSend: number,
+  targetName: string,
+): Promise<void> {
+  const sendButton = await findSendButton(page)
+
+  if (sendButton && (await sendButton.isEnabled().catch(() => false))) {
+    await sendButton.scrollIntoViewIfNeeded()
+    await sendButton.click({ timeout: 5000 })
+  } else {
+    // 抖音部分版本隐藏发送按钮，Enter 是官方聊天编辑器的发送快捷键。
+    await editor.press('Enter')
+  }
+
+  const deadline = Date.now() + MESSAGE_SEND_TIMEOUT
+  while (Date.now() < deadline) {
+    const editorText = await readEditorText(editor)
+    const currentCount = await countVisibleMessageText(page, message)
+    const bodyText = await page
+      .locator('body')
+      .innerText()
+      .catch(() => '')
+
+    // 编辑器清空 + 聊天记录出现新文本，两个条件同时满足才算发送成功。
+    if (
+      !normalizeMessageText(editorText) &&
+      (currentCount > messageCountBeforeSend || messageTextMatches(bodyText, message))
+    ) {
+      return
+    }
+
+    await page.waitForTimeout(MESSAGE_POLL_INTERVAL)
+  }
+
+  throw new Error(`消息未得到抖音确认：${targetName}。发送按钮可能未生效或消息被拦截`)
+}
+
+async function findSendButton(page: Page): Promise<Locator | undefined> {
+  const candidates = [
+    page.getByRole('button', { name: /^\s*发送\s*$/ }).last(),
+    page
+      .locator('button')
+      .filter({ hasText: /^\s*发送\s*$/ })
+      .last(),
+    page
+      .locator('[role="button"]')
+      .filter({ hasText: /^\s*发送\s*$/ })
+      .last(),
+    page.locator('[aria-label*="发送"], [title*="发送"], [data-e2e*="send"]:visible').last(),
+  ]
+
+  for (const candidate of candidates) {
+    if (await candidate.isVisible().catch(() => false)) {
+      return candidate
+    }
+  }
+
+  return undefined
+}
+
+async function readEditorText(editor: Locator): Promise<string> {
+  return editor.evaluate((element) => {
+    if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
+      return element.value
+    }
+    return (element as HTMLElement).innerText || element.textContent || ''
+  })
+}
+
+function normalizeMessageText(value: string): string {
+  return value
+    .replace(/\u200b/g, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\u00a0/g, ' ')
+    .trim()
+}
+
+function messageTextMatches(actual: string, expected: string): boolean {
+  const normalizedActual = normalizeMessageText(actual)
+  const normalizedExpected = normalizeMessageText(expected)
+  return Boolean(normalizedExpected) && normalizedActual.includes(normalizedExpected)
+}
+
+async function countVisibleMessageText(page: Page, message: string): Promise<number> {
+  const matches = page.getByText(message, { exact: true })
+  const count = await matches.count()
+  let visibleCount = 0
+
+  for (let index = 0; index < count; index += 1) {
+    if (
+      await matches
+        .nth(index)
+        .isVisible()
+        .catch(() => false)
+    ) {
+      visibleCount += 1
+    }
+  }
+
+  return visibleCount
 }
 
 /**
