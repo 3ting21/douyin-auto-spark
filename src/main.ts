@@ -130,14 +130,10 @@ async function runDouyinAccount(
       waitUntil: 'domcontentloaded',
     })
 
-    const searchInput = page.locator('input.semi-input[placeholder="搜索"]').first()
-    const searchVisible = await searchInput
-      .waitFor({ state: 'visible', timeout: CHAT_PAGE_READY_TIMEOUT })
-      .then(() => true)
-      .catch(() => false)
+    const searchInput = await findChatSearchInput(page)
 
-    if (!searchVisible) {
-      throw new Error('聊天页搜索框未出现，Cookie 可能已经失效')
+    if (!searchInput) {
+      throw new Error(await diagnoseChatPageUnavailable(page))
     }
 
     await waitForChatListReady(page, account.name)
@@ -203,6 +199,88 @@ async function runDouyinAccount(
     if (autoClose) {
       await context.close()
     }
+  }
+}
+
+/**
+ * 等待聊天页搜索框。抖音会灰度发布不同 DOM 结构，不能依赖单一 CSS 类名。
+ */
+async function findChatSearchInput(page: Page): Promise<Locator | undefined> {
+  const candidates = [
+    page.locator('input.semi-input[placeholder="搜索"]:visible'),
+    page.locator('input[placeholder="搜索"]:visible'),
+    page.locator('input[placeholder*="搜索"]:visible'),
+    page.locator('input[aria-label*="搜索"]:visible'),
+    page.locator('[role="searchbox"]:visible'),
+    page.locator('input[type="search"]:visible'),
+  ]
+  const deadline = Date.now() + CHAT_PAGE_READY_TIMEOUT
+
+  while (Date.now() < deadline) {
+    for (const candidate of candidates) {
+      const first = candidate.first()
+      if (await first.isVisible().catch(() => false)) {
+        return first
+      }
+    }
+
+    await page.waitForTimeout(MESSAGE_POLL_INTERVAL)
+  }
+
+  return undefined
+}
+
+/**
+ * 区分 Cookie 失效、抖音风控和页面结构变化，避免所有初始化失败都误报为 Cookie 问题。
+ */
+async function diagnoseChatPageUnavailable(page: Page): Promise<string> {
+  const pageUrl = toSafePageUrl(page.url())
+  const title = await page.title().catch(() => '')
+  const bodyText = await page
+    .locator('body')
+    .innerText({ timeout: 5000 })
+    .catch(() => '')
+  const evidence = `${pageUrl}\n${title}\n${bodyText}`
+
+  console.log(`聊天页诊断：URL=${pageUrl || '未知'}，标题=${title || '无'}`)
+
+  if (
+    /captcha|verify|安全验证|访问过于频繁|操作频繁|环境异常|请求异常|风险|滑块|网络异常/i.test(
+      evidence,
+    )
+  ) {
+    return (
+      `聊天页被抖音安全验证或访问限制拦截（URL：${pageUrl || '未知'}，` +
+      `标题：${title || '无'}）。GitHub Actions 的云端 IP 可能触发风控，请下载失败截图确认`
+    )
+  }
+
+  if (/login|登录|扫码登录|验证码登录|手机号登录|密码登录/i.test(evidence)) {
+    return (
+      `抖音登录状态无效或已跳转到登录页（URL：${pageUrl || '未知'}，` +
+      `标题：${title || '无'}）。请重新导出完整 Cookie 并更新 DOUYIN_COOKIE`
+    )
+  }
+
+  if (!bodyText.trim()) {
+    return (
+      `抖音聊天页未渲染出内容（URL：${pageUrl || '未知'}，标题：${title || '无'}）。` +
+      `页面资源可能被云端网络或风控拦截，请下载失败截图确认`
+    )
+  }
+
+  return (
+    `聊天页已打开但未找到搜索框（URL：${pageUrl || '未知'}，标题：${title || '无'}）。` +
+    `可能是抖音页面结构发生变化，请下载失败截图确认`
+  )
+}
+
+function toSafePageUrl(value: string): string {
+  try {
+    const url = new URL(value)
+    return `${url.origin}${url.pathname}`
+  } catch {
+    return value.split('?')[0]?.split('#')[0] ?? ''
   }
 }
 
