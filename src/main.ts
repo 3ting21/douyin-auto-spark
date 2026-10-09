@@ -176,15 +176,8 @@ async function runDouyinAccount(
         message = includeYiyanSource ? `${yiyan.hitokoto}\n——「${yiyan.from}」` : yiyan.hitokoto
       }
 
-      await sendMessageWithFreshVerification(
-        browser,
-        page,
-        editorInput,
-        message,
-        account.name,
-        targetName,
-      )
-      console.log(`[${account.name}] 已在独立会话中确认消息：${targetName}`)
+      await sendMessageWithFreshVerification(page, editorInput, message, account.name, targetName)
+      console.log(`[${account.name}] 刷新聊天页后仍可看到新消息：${targetName}`)
     }
 
     await page.waitForTimeout(5000)
@@ -404,52 +397,42 @@ async function submitMessage(page: Page, editor: Locator, targetName: string): P
 }
 
 /**
- * 在不共享页面缓存的浏览器上下文中对比发送前后的记录数量。
- * 当前页乐观渲染的消息不足以证明服务端保存了消息。
+ * 刷新当前已登录的聊天页，对比发送前后的记录数量。
+ * 这可排除仅在当前页面短暂回显的消息，但不能证明对方已收到。
  */
 async function sendMessageWithFreshVerification(
-  browser: Browser,
   page: Page,
   editor: Locator,
   message: string,
   accountName: string,
   targetName: string,
 ): Promise<void> {
-  const verificationContext = await browser.newContext()
-  let verificationPage: Page | undefined
+  const countBeforeSend = await countVisibleMessageText(page, message)
+
+  await fillMessageEditor(editor, message)
+  await submitMessage(page, editor, targetName)
+  console.log(`[${accountName}] 页面已提交消息，正在刷新聊天页核验：${targetName}`)
 
   try {
-    await verificationContext.addCookies(await page.context().cookies())
-    verificationPage = await verificationContext.newPage()
-    await verificationPage.goto('https://www.douyin.com/chat', {
-      waitUntil: 'domcontentloaded',
-    })
-    await openChatForVerification(verificationPage, accountName, targetName)
-    const countBeforeSend = await countVisibleMessageText(verificationPage, message)
-
-    await fillMessageEditor(editor, message)
-    await submitMessage(page, editor, targetName)
-    console.log(`[${accountName}] 页面已提交消息，正在独立会话核验：${targetName}`)
-
-    await verificationPage.reload({ waitUntil: 'domcontentloaded' })
-    await openChatForVerification(verificationPage, accountName, targetName)
+    // 编辑框清空可能早于发送请求完成，避免立即刷新中断请求。
+    await page.waitForLoadState('networkidle', { timeout: CHAT_PAGE_IDLE_TIMEOUT }).catch(() => {})
+    await page.reload({ waitUntil: 'domcontentloaded' })
+    await openChatForVerification(page, accountName, targetName)
 
     const deadline = Date.now() + MESSAGE_PERSISTENCE_TIMEOUT
     while (Date.now() < deadline) {
-      if ((await countVisibleMessageText(verificationPage, message)) > countBeforeSend) {
+      if ((await countVisibleMessageText(page, message)) > countBeforeSend) {
         return
       }
-      await verificationPage.waitForTimeout(MESSAGE_POLL_INTERVAL)
+      await page.waitForTimeout(MESSAGE_POLL_INTERVAL)
     }
 
     throw new Error(
-      `独立会话中未发现新消息：${targetName}。页面可能只是暂时回显，无法确认抖音保存了消息`,
+      `刷新聊天页后未看到新消息：${targetName}。消息可能未保存，请核对聊天记录后再决定是否重试`,
     )
   } catch (error) {
-    await captureFailureScreenshot(verificationPage, `${accountName}-${targetName}-verification`)
+    await captureFailureScreenshot(page, `${accountName}-${targetName}-verification`)
     throw error
-  } finally {
-    await verificationContext.close()
   }
 }
 
@@ -460,13 +443,13 @@ async function openChatForVerification(
 ): Promise<void> {
   const searchInput = await findChatSearchInput(page)
   if (!searchInput) {
-    throw new Error(`独立会话无法加载聊天页：${await diagnoseChatPageUnavailable(page)}`)
+    throw new Error(`刷新后无法加载聊天页：${await diagnoseChatPageUnavailable(page)}`)
   }
 
   await waitForChatListReady(page, accountName)
   const searchResult = await searchConversation(page, searchInput, accountName, targetName)
   if (!searchResult) {
-    throw new Error(`独立会话找不到好友：${targetName}`)
+    throw new Error(`刷新后找不到好友：${targetName}`)
   }
 
   await openConversation(page, searchResult, targetName)
