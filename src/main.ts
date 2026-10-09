@@ -30,6 +30,7 @@ const SEARCH_RETRY_INTERVAL = 2000
 const SEARCH_INPUT_RESET_DELAY = 500
 const MESSAGE_EDITOR_TIMEOUT = 15000
 const MESSAGE_SEND_TIMEOUT = 15000
+const MESSAGE_PERSISTENCE_TIMEOUT = 20000
 const MESSAGE_POLL_INTERVAL = 250
 
 const MESSAGE_TEMPLATE_PLACEHOLDER_PATTERN = /\{\{\s*([a-zA-Z]+)\s*\}\}/g
@@ -175,10 +176,15 @@ async function runDouyinAccount(
         message = includeYiyanSource ? `${yiyan.hitokoto}\n——「${yiyan.from}」` : yiyan.hitokoto
       }
 
-      const messageCountBeforeSend = await countVisibleMessageText(page, message)
-      await fillMessageEditor(editorInput, message)
-      await sendMessageAndConfirm(page, editorInput, message, messageCountBeforeSend, targetName)
-      console.log(`[${account.name}] 已确认发送消息：${targetName}`)
+      await sendMessageWithFreshVerification(
+        browser,
+        page,
+        editorInput,
+        message,
+        account.name,
+        targetName,
+      )
+      console.log(`[${account.name}] 已在独立会话中确认消息：${targetName}`)
     }
 
     await page.waitForTimeout(5000)
@@ -369,16 +375,10 @@ async function fillMessageEditor(editor: Locator, message: string): Promise<void
 }
 
 /**
- * 点击发送按钮（若当前版本没有按钮则使用 Enter），并等待聊天记录中出现本次消息。
- * 未确认到消息时抛错，避免日志把“只输入到编辑框”误报成发送成功。
+ * 点击发送按钮（若当前版本没有按钮则使用 Enter）并等待编辑框清空。
+ * 这只说明本页提交了消息，不代表服务器已保存。
  */
-async function sendMessageAndConfirm(
-  page: Page,
-  editor: Locator,
-  message: string,
-  messageCountBeforeSend: number,
-  targetName: string,
-): Promise<void> {
+async function submitMessage(page: Page, editor: Locator, targetName: string): Promise<void> {
   const sendButton = await findSendButton(page)
 
   if (sendButton && (await sendButton.isEnabled().catch(() => false))) {
@@ -392,24 +392,85 @@ async function sendMessageAndConfirm(
   const deadline = Date.now() + MESSAGE_SEND_TIMEOUT
   while (Date.now() < deadline) {
     const editorText = await readEditorText(editor)
-    const currentCount = await countVisibleMessageText(page, message)
-    const bodyText = await page
-      .locator('body')
-      .innerText()
-      .catch(() => '')
 
-    // 编辑器清空 + 聊天记录出现新文本，两个条件同时满足才算发送成功。
-    if (
-      !normalizeMessageText(editorText) &&
-      (currentCount > messageCountBeforeSend || messageTextMatches(bodyText, message))
-    ) {
+    if (!normalizeMessageText(editorText)) {
       return
     }
 
     await page.waitForTimeout(MESSAGE_POLL_INTERVAL)
   }
 
-  throw new Error(`消息未得到抖音确认：${targetName}。发送按钮可能未生效或消息被拦截`)
+  throw new Error(`提交消息后编辑框未清空：${targetName}。发送按钮可能未生效`)
+}
+
+/**
+ * 在不共享页面缓存的浏览器上下文中对比发送前后的记录数量。
+ * 当前页乐观渲染的消息不足以证明服务端保存了消息。
+ */
+async function sendMessageWithFreshVerification(
+  browser: Browser,
+  page: Page,
+  editor: Locator,
+  message: string,
+  accountName: string,
+  targetName: string,
+): Promise<void> {
+  const verificationContext = await browser.newContext()
+  let verificationPage: Page | undefined
+
+  try {
+    await verificationContext.addCookies(await page.context().cookies())
+    verificationPage = await verificationContext.newPage()
+    await verificationPage.goto('https://www.douyin.com/chat', {
+      waitUntil: 'domcontentloaded',
+    })
+    await openChatForVerification(verificationPage, accountName, targetName)
+    const countBeforeSend = await countVisibleMessageText(verificationPage, message)
+
+    await fillMessageEditor(editor, message)
+    await submitMessage(page, editor, targetName)
+    console.log(`[${accountName}] 页面已提交消息，正在独立会话核验：${targetName}`)
+
+    await verificationPage.reload({ waitUntil: 'domcontentloaded' })
+    await openChatForVerification(verificationPage, accountName, targetName)
+
+    const deadline = Date.now() + MESSAGE_PERSISTENCE_TIMEOUT
+    while (Date.now() < deadline) {
+      if ((await countVisibleMessageText(verificationPage, message)) > countBeforeSend) {
+        return
+      }
+      await verificationPage.waitForTimeout(MESSAGE_POLL_INTERVAL)
+    }
+
+    throw new Error(
+      `独立会话中未发现新消息：${targetName}。页面可能只是暂时回显，无法确认抖音保存了消息`,
+    )
+  } catch (error) {
+    await captureFailureScreenshot(verificationPage, `${accountName}-${targetName}-verification`)
+    throw error
+  } finally {
+    await verificationContext.close()
+  }
+}
+
+async function openChatForVerification(
+  page: Page,
+  accountName: string,
+  targetName: string,
+): Promise<void> {
+  const searchInput = await findChatSearchInput(page)
+  if (!searchInput) {
+    throw new Error(`独立会话无法加载聊天页：${await diagnoseChatPageUnavailable(page)}`)
+  }
+
+  await waitForChatListReady(page, accountName)
+  const searchResult = await searchConversation(page, searchInput, accountName, targetName)
+  if (!searchResult) {
+    throw new Error(`独立会话找不到好友：${targetName}`)
+  }
+
+  await openConversation(page, searchResult, targetName)
+  await findMessageEditor(page)
 }
 
 async function findSendButton(page: Page): Promise<Locator | undefined> {
