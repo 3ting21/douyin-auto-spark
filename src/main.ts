@@ -21,6 +21,8 @@ const DOUYIN_TARGET_NAMES_KEY = 'DOUYIN_TARGET_NAMES'
 const YIYAN_INCLUDE_SOURCE_KEY = 'YIYAN_INCLUDE_SOURCE'
 const SPARK_MESSAGE_TEMPLATE_KEY = 'SPARK_MESSAGE_TEMPLATE'
 const FAILURE_SCREENSHOT_DIRECTORY = 'artifacts'
+const FIXED_SPARK_TARGET = '再睡三分钟'
+const FIXED_SPARK_MESSAGE = '再睡三分钟，今天来续火花啦🔥 希望你今天开心顺利，记得好好休息呀！'
 
 const CHAT_PAGE_READY_TIMEOUT = 30000
 const CHAT_PAGE_IDLE_TIMEOUT = 10000
@@ -164,7 +166,9 @@ async function runDouyinAccount(
 
       let message: string
 
-      if (account.messageTemplate !== undefined) {
+      if (targetName === FIXED_SPARK_TARGET) {
+        message = FIXED_SPARK_MESSAGE
+      } else if (account.messageTemplate !== undefined) {
         message = renderMessageTemplate(
           account.messageTemplate,
           account.name,
